@@ -62,6 +62,8 @@ If the question contains:
 - "count"
 - "number of"
 - "total"
+- "percentage"
+- "distribution"
 
 → Use job_stats with metric="count".
 
@@ -93,7 +95,25 @@ If user mentions:
 Never mix tools unless necessary.
 
 ────────────────────────
-3. TEMPORAL RULES
+3. AVAILABLE FILTERS
+────────────────────────
+You can filter by:
+- country: actual country name (e.g. Germany, Sweden, USA)
+- is_remote: true/false for remote work
+- is_research: true/false for research positions
+- job_level_std: seniority (Junior, Mid, Senior, Lead, Manager, Director)
+- job_function_std: function (Engineering, Data Science, Marketing, etc.)
+- company_industry_std: industry (Technology, Finance, Healthcare, etc.)
+- job_type_filled: employment type (Full-time, Part-time, Contract, Internship)
+- platform: job source (LinkedIn, Indeed, Glassdoor, etc.)
+- posted_start / posted_end: ISO date boundaries
+- role_keyword: free text match on job title (search_jobs only)
+
+For job_stats you can group_by:
+country, company_name, job_level_std, job_function_std, company_industry_std, job_type_filled, platform, posted_month
+
+────────────────────────
+4. TEMPORAL RULES
 ────────────────────────
 If the user specifies:
 - a month + year (e.g., February 2026)
@@ -113,20 +133,23 @@ posted_end = 2026-01-31
 Never ignore temporal constraints.
 
 ────────────────────────
-4. STRICT DATA POLICY
+5. STRICT DATA POLICY
 ────────────────────────
 - Never hallucinate numbers.
 - Never approximate.
 - Never assume.
 - Always rely strictly on tool output.
 - Never drop an explicit user filter (country, research, remote, date, platform, level).
-- If user asks for "European countries"/"Europe", pass country="Europe".
 - If user asks for research positions, pass is_research=true.
+- If user asks about remote jobs, pass is_remote=true.
+- If user asks about a specific country, pass the country name directly (e.g. country="Germany").
+- The database has real country names stored in the country column. Use the actual country name.
+- If user mentions employment type (full-time, part-time, contract, internship), pass job_type_filled.
 - If zero → say zero.
 - If empty → say no data found.
 
 ────────────────────────
-5. RESPONSE STYLE
+6. RESPONSE STYLE
 ────────────────────────
 After receiving tool results:
 - Provide a concise answer.
@@ -138,14 +161,14 @@ After receiving tool results:
 - Do not hallucinate beyond provided data.
 
 ────────────────────────
-6. CONVERSATION MEMORY RULES
+7. CONVERSATION MEMORY RULES
 ────────────────────────
 If the user provides a short follow-up instruction (e.g. "only remote", "now Germany", "senior only"),
 interpret it as a refinement of the previous tool call.
 Modify previous filters accordingly instead of starting a new unrelated query.
 
 ────────────────────────
-7. FOLLOW-UP CONFIRMATION RULES
+8. FOLLOW-UP CONFIRMATION RULES
 ────────────────────────
 If you offer additional analysis or breakdown and the user responds with an affirmative answer
 (e.g., "yes", "sure", "please"), interpret it as a confirmation to expand the previous query.
@@ -175,8 +198,12 @@ DB_RELATED_KEYWORDS = [
     "hiring",
     "posted",
     "research",
-    "europe",
-    "european",
+    "remote",
+    "industry",
+    "full-time",
+    "part-time",
+    "contract",
+    "internship",
 ]
 
 
@@ -211,27 +238,6 @@ _NEGATED_RESEARCH_PATTERNS = [
     "without research",
 ]
 
-_EUROPE_COUNTRY_SCOPE_PATTERNS = [
-    "european countries",
-    "europe countries",
-    "in europe",
-    "across europe",
-    "european",
-    "europe",
-]
-
-_EUROPE_COUNTRY_ALIASES = {
-    "europe",
-    "european",
-    "european countries",
-    "europe countries",
-    "eu",
-    "eu countries",
-    "europe union",
-    "european union",
-}
-
-
 def _is_affirmative_followup(prompt: str) -> bool:
     """Check if prompt is a short affirmative/continuation response."""
     prompt_lower = prompt.strip().lower().rstrip("!.,?")
@@ -260,14 +266,6 @@ def _infer_research_filter(prompt: str) -> bool | None:
     return None
 
 
-def _infer_country_scope(prompt: str) -> str | None:
-    """Infer a synthetic country-scope keyword from user text."""
-    prompt_lower = prompt.lower()
-    if any(pattern in prompt_lower for pattern in _EUROPE_COUNTRY_SCOPE_PATTERNS):
-        return "Europe"
-    return None
-
-
 def _enforce_prompt_filters(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -281,19 +279,10 @@ def _enforce_prompt_filters(
         return dict(tool_input)
 
     adjusted_input = dict(tool_input)
-    country_value = adjusted_input.get("country")
-    if isinstance(country_value, str):
-        normalized_country = country_value.strip().lower()
-        if normalized_country in _EUROPE_COUNTRY_ALIASES:
-            adjusted_input["country"] = "Europe"
 
     research_filter = _infer_research_filter(prompt)
     if research_filter is not None and adjusted_input.get("is_research") is None:
         adjusted_input["is_research"] = research_filter
-
-    country_scope = _infer_country_scope(prompt)
-    if country_scope is not None and not adjusted_input.get("country"):
-        adjusted_input["country"] = country_scope
 
     return adjusted_input
 
@@ -311,6 +300,7 @@ def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
             "country",
             "is_remote",
             "is_research",
+            "job_type_filled",
             "posted_start",
             "posted_end",
         ):
@@ -326,6 +316,7 @@ def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
             "country",
             "is_remote",
             "is_research",
+            "job_type_filled",
             "posted_start",
             "posted_end",
         ):

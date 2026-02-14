@@ -15,72 +15,6 @@ from app.schemas.tools import SAFE_COLUMNS, JobStatsInput, SearchJobsInput
 
 logger = logging.getLogger(__name__)
 
-COUNTRY_SCOPE_PATTERNS: dict[str, tuple[str, ...]] = {
-    "europe": (
-        "Albania",
-        "Andorra",
-        "Armenia",
-        "Austria",
-        "Azerbaijan",
-        "Belarus",
-        "Belgium",
-        "Bosnia",
-        "Bulgaria",
-        "Croatia",
-        "Cyprus",
-        "Czech",
-        "Denmark",
-        "Estonia",
-        "Finland",
-        "France",
-        "Georgia",
-        "Germany",
-        "Greece",
-        "Hungary",
-        "Iceland",
-        "Ireland",
-        "Italy",
-        "Kosovo",
-        "Latvia",
-        "Liechtenstein",
-        "Lithuania",
-        "Luxembourg",
-        "Malta",
-        "Moldova",
-        "Monaco",
-        "Montenegro",
-        "Netherlands",
-        "North Macedonia",
-        "Norway",
-        "Poland",
-        "Portugal",
-        "Romania",
-        "San Marino",
-        "Serbia",
-        "Slovakia",
-        "Slovenia",
-        "Spain",
-        "Sweden",
-        "Switzerland",
-        "Turkey",
-        "Ukraine",
-        "UK",
-        "United Kingdom",
-        "Vatican",
-    )
-}
-
-EUROPE_SCOPE_ALIASES = {
-    "europe",
-    "european",
-    "european countries",
-    "europe countries",
-    "eu",
-    "eu countries",
-    "europe union",
-    "european union",
-}
-
 
 def _headers() -> dict[str, str]:
     """Auth headers for Supabase REST (service_role, bypasses RLS)."""
@@ -97,27 +31,13 @@ def _base_url() -> str:
     return f"{get_settings().supabase_url.rstrip('/')}/rest/v1"
 
 
-def _apply_country_scope_filter(qs: dict[str, str], scope: str | None) -> None:
-    """Apply an OR clause that scopes results to a predefined set of countries."""
-    if not scope:
-        return
-
-    country_patterns = COUNTRY_SCOPE_PATTERNS.get(scope)
-    if not country_patterns:
-        return
-
-    scope_or_filters = ",".join(
-        f"country.ilike.%{country_pattern}%" for country_pattern in country_patterns
-    )
-    qs["or"] = f"({scope_or_filters})"
-
-
 def _apply_common_filters(
     qs: dict[str, str],
     *,
     country: str | None,
     is_remote: bool | None,
     is_research: bool | None,
+    job_type_filled: str | None = None,
     posted_start: str | None,
     posted_end: str | None,
 ) -> None:
@@ -128,16 +48,15 @@ def _apply_common_filters(
     # Keep AI analytics consistent with dashboard behavior.
     qs["has_url_duplicate"] = "eq.0"
 
-    normalized_country = country.strip() if isinstance(country, str) else country
-    if isinstance(normalized_country, str) and normalized_country.lower() in EUROPE_SCOPE_ALIASES:
-        _apply_country_scope_filter(qs, "europe")
-    elif normalized_country:
-        qs["country"] = f"ilike.%{normalized_country}%"
+    if country and isinstance(country, str) and country.strip():
+        qs["country"] = f"ilike.%{country.strip()}%"
 
     if is_remote is not None:
         qs["is_remote"] = f"eq.{str(is_remote).lower()}"
     if is_research is not None:
         qs["is_research"] = f"eq.{str(is_research).lower()}"
+    if job_type_filled and isinstance(job_type_filled, str) and job_type_filled.strip():
+        qs["job_type_filled"] = f"ilike.%{job_type_filled.strip()}%"
 
     if posted_start and posted_end:
         qs["and"] = f"(posted_date.gte.{posted_start},posted_date.lte.{posted_end})"
@@ -179,6 +98,7 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
         country=params.country,
         is_remote=params.is_remote,
         is_research=params.is_research,
+        job_type_filled=params.job_type_filled,
         posted_start=params.posted_start,
         posted_end=params.posted_end,
     )
@@ -215,6 +135,7 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
         country=params.country,
         is_remote=params.is_remote,
         is_research=params.is_research,
+        job_type_filled=params.job_type_filled,
         posted_start=params.posted_start,
         posted_end=params.posted_end,
     )
@@ -269,6 +190,11 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     # return a single total count instead of a one-bucket grouped result.
     group_dimension_filters: dict[str, Any] = {
         "country": params.country,
+        "job_level_std": getattr(params, "job_level_std", None),
+        "job_function_std": getattr(params, "job_function_std", None),
+        "company_industry_std": getattr(params, "company_industry_std", None),
+        "job_type_filled": params.job_type_filled,
+        "platform": getattr(params, "platform", None),
     }
     dimension_filter_value = group_dimension_filters.get(params.group_by)
     total_only_mode = (
@@ -312,40 +238,51 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "search_jobs",
         "description": (
             "Search the jobs database using structured filters. "
-            "Returns matching job listings with key fields."
+            "Returns matching job listings with key fields. "
+            "Use this when users ask to list, show, find, or search for specific jobs."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "role_keyword": {
                     "type": "string",
-                    "description": "Search keyword to filter by position name/title (e.g. Data Scientist, Software Engineer, Product Manager)",
+                    "description": "Search keyword to filter by position name/title (e.g. Data Scientist, Software Engineer, Product Manager). Matched against the actual_role column.",
                 },
-                "country": {"type": "string", "description": "Country name filter"},
-                "is_remote": {"type": "boolean", "description": "Remote jobs only"},
+                "country": {
+                    "type": "string",
+                    "description": "Country name filter (e.g. Germany, Sweden, USA). Matched with case-insensitive partial match.",
+                },
+                "is_remote": {"type": "boolean", "description": "Filter for remote jobs only (true) or non-remote only (false)"},
+                "is_research": {"type": "boolean", "description": "Filter for research positions only (true) or non-research only (false)"},
                 "job_level_std": {
                     "type": "string",
-                    "description": "Job level (e.g. Junior, Mid, Senior)",
+                    "description": "Standardised seniority level (e.g. Junior, Mid, Senior, Lead, Manager, Director)",
                 },
-                "job_function_std": {"type": "string", "description": "Job function category"},
+                "job_function_std": {
+                    "type": "string",
+                    "description": "Standardised job function category (e.g. Engineering, Data Science, Marketing, Sales, Design, Product, Finance, HR, Operations)",
+                },
                 "company_industry_std": {
                     "type": "string",
-                    "description": "Company industry",
+                    "description": "Standardised company industry (e.g. Technology, Finance, Healthcare, Education, Retail)",
+                },
+                "job_type_filled": {
+                    "type": "string",
+                    "description": "Employment type (e.g. Full-time, Part-time, Contract, Internship)",
                 },
                 "platform": {
                     "type": "string",
-                    "description": "Job platform (e.g. LinkedIn, Indeed)",
+                    "description": "Job platform source (e.g. LinkedIn, Indeed, Glassdoor)",
                 },
-                "is_research": {"type": "boolean", "description": "Research positions only"},
                 "posted_start": {
                     "type": "string",
-                    "description": "ISO date YYYY-MM-DD - return jobs posted on or after this date (inclusive)",
+                    "description": "ISO date YYYY-MM-DD – return jobs posted on or after this date (inclusive)",
                 },
                 "posted_end": {
                     "type": "string",
-                    "description": "ISO date YYYY-MM-DD - return jobs posted on or before this date (inclusive)",
+                    "description": "ISO date YYYY-MM-DD – return jobs posted on or before this date (inclusive)",
                 },
-                "limit": {"type": "integer", "description": "Max results (default 20, max 100)"},
+                "limit": {"type": "integer", "description": "Max results to return (default 20, max 100)"},
             },
         },
     },
@@ -353,7 +290,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "job_stats",
         "description": (
             "Get aggregated job statistics (counts) grouped by a dimension. "
-            "Use this for questions about trends, distributions, or totals."
+            "Use this for questions about totals, trends over time, distributions, "
+            "or comparisons across categories."
         ),
         "input_schema": {
             "type": "object",
@@ -361,7 +299,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "metric": {
                     "type": "string",
                     "enum": ["count"],
-                    "description": "Aggregation metric",
+                    "description": "Aggregation metric (currently only count is supported)",
                 },
                 "group_by": {
                     "type": "string",
@@ -370,21 +308,27 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "company_name",
                         "job_level_std",
                         "job_function_std",
+                        "company_industry_std",
+                        "job_type_filled",
                         "platform",
                         "posted_month",
                     ],
-                    "description": "Column to group results by",
+                    "description": "Dimension to group results by. Use posted_month for time-series / trend analysis.",
                 },
-                "country": {"type": "string", "description": "Optional country filter"},
+                "country": {"type": "string", "description": "Optional country filter (e.g. Germany, Sweden)"},
                 "is_remote": {"type": "boolean", "description": "Optional remote filter"},
                 "is_research": {"type": "boolean", "description": "Optional research filter"},
+                "job_type_filled": {
+                    "type": "string",
+                    "description": "Optional employment type filter (e.g. Full-time, Part-time, Contract, Internship)",
+                },
                 "posted_start": {
                     "type": "string",
-                    "description": "ISO date YYYY-MM-DD - count jobs posted on or after this date",
+                    "description": "ISO date YYYY-MM-DD – count jobs posted on or after this date",
                 },
                 "posted_end": {
                     "type": "string",
-                    "description": "ISO date YYYY-MM-DD - count jobs posted on or before this date",
+                    "description": "ISO date YYYY-MM-DD – count jobs posted on or before this date",
                 },
             },
             "required": ["metric", "group_by"],
