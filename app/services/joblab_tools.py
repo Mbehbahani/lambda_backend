@@ -1,8 +1,8 @@
 """
-JobLab tool implementations – execute validated tool calls against Supabase.
+JobLab tool implementations - execute validated tool calls against Supabase.
 
-All queries use the PostgREST API with parameterised query-string filters.
-NO raw SQL is ever sent.  The service_role key is used server-side only.
+All queries use the PostgREST API with parameterized query-string filters.
+NO raw SQL is ever sent. The service_role key is used server-side only.
 """
 
 import logging
@@ -11,15 +11,75 @@ from typing import Any
 import requests
 
 from app.config import get_settings
-from app.schemas.tools import (
-    SAFE_COLUMNS,
-    SearchJobsInput,
-    JobStatsInput,
-)
+from app.schemas.tools import SAFE_COLUMNS, JobStatsInput, SearchJobsInput
 
 logger = logging.getLogger(__name__)
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+COUNTRY_SCOPE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "europe": (
+        "Albania",
+        "Andorra",
+        "Armenia",
+        "Austria",
+        "Azerbaijan",
+        "Belarus",
+        "Belgium",
+        "Bosnia",
+        "Bulgaria",
+        "Croatia",
+        "Cyprus",
+        "Czech",
+        "Denmark",
+        "Estonia",
+        "Finland",
+        "France",
+        "Georgia",
+        "Germany",
+        "Greece",
+        "Hungary",
+        "Iceland",
+        "Ireland",
+        "Italy",
+        "Kosovo",
+        "Latvia",
+        "Liechtenstein",
+        "Lithuania",
+        "Luxembourg",
+        "Malta",
+        "Moldova",
+        "Monaco",
+        "Montenegro",
+        "Netherlands",
+        "North Macedonia",
+        "Norway",
+        "Poland",
+        "Portugal",
+        "Romania",
+        "San Marino",
+        "Serbia",
+        "Slovakia",
+        "Slovenia",
+        "Spain",
+        "Sweden",
+        "Switzerland",
+        "Turkey",
+        "Ukraine",
+        "UK",
+        "United Kingdom",
+        "Vatican",
+    )
+}
+
+EUROPE_SCOPE_ALIASES = {
+    "europe",
+    "european",
+    "european countries",
+    "europe countries",
+    "eu",
+    "eu countries",
+    "europe union",
+    "european union",
+}
 
 
 def _headers() -> dict[str, str]:
@@ -37,8 +97,57 @@ def _base_url() -> str:
     return f"{get_settings().supabase_url.rstrip('/')}/rest/v1"
 
 
-# ── Tool: search_jobs ──────────────────────────────────────────────────────
+def _apply_country_scope_filter(qs: dict[str, str], scope: str | None) -> None:
+    """Apply an OR clause that scopes results to a predefined set of countries."""
+    if not scope:
+        return
 
+    country_patterns = COUNTRY_SCOPE_PATTERNS.get(scope)
+    if not country_patterns:
+        return
+
+    scope_or_filters = ",".join(
+        f"country.ilike.%{country_pattern}%" for country_pattern in country_patterns
+    )
+    qs["or"] = f"({scope_or_filters})"
+
+
+def _apply_common_filters(
+    qs: dict[str, str],
+    *,
+    country: str | None,
+    is_remote: bool | None,
+    is_research: bool | None,
+    posted_start: str | None,
+    posted_end: str | None,
+) -> None:
+    """
+    Apply shared filters used by both tools.
+    This keeps stats/listing totals aligned with dashboard filtering.
+    """
+    # Keep AI analytics consistent with dashboard behavior.
+    qs["has_url_duplicate"] = "eq.0"
+
+    normalized_country = country.strip() if isinstance(country, str) else country
+    if isinstance(normalized_country, str) and normalized_country.lower() in EUROPE_SCOPE_ALIASES:
+        _apply_country_scope_filter(qs, "europe")
+    elif normalized_country:
+        qs["country"] = f"ilike.%{normalized_country}%"
+
+    if is_remote is not None:
+        qs["is_remote"] = f"eq.{str(is_remote).lower()}"
+    if is_research is not None:
+        qs["is_research"] = f"eq.{str(is_research).lower()}"
+
+    if posted_start and posted_end:
+        qs["and"] = f"(posted_date.gte.{posted_start},posted_date.lte.{posted_end})"
+    elif posted_start:
+        qs["posted_date"] = f"gte.{posted_start}"
+    elif posted_end:
+        qs["posted_date"] = f"lte.{posted_end}"
+
+
+# Tool: search_jobs
 
 def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     """
@@ -56,10 +165,6 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     # Text search filters (PostgREST ilike operators)
     if params.role_keyword:
         qs["actual_role"] = f"ilike.%{params.role_keyword}%"
-    if params.country:
-        qs["country"] = f"ilike.%{params.country}%"
-    if params.is_remote is not None:
-        qs["is_remote"] = f"eq.{str(params.is_remote).lower()}"
     if params.job_level_std:
         qs["job_level_std"] = f"ilike.%{params.job_level_std}%"
     if params.job_function_std:
@@ -68,17 +173,15 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
         qs["company_industry_std"] = f"ilike.%{params.company_industry_std}%"
     if params.platform:
         qs["platform"] = f"ilike.%{params.platform}%"
-    if params.is_research is not None:
-        qs["is_research"] = f"eq.{str(params.is_research).lower()}"
 
-    # Date-range filters (PostgREST AND logic via separate params)
-    if params.posted_start and params.posted_end:
-        # PostgREST: combine with and=(posted_date.gte.<start>,posted_date.lte.<end>)
-        qs["and"] = f"(posted_date.gte.{params.posted_start},posted_date.lte.{params.posted_end})"
-    elif params.posted_start:
-        qs["posted_date"] = f"gte.{params.posted_start}"
-    elif params.posted_end:
-        qs["posted_date"] = f"lte.{params.posted_end}"
+    _apply_common_filters(
+        qs,
+        country=params.country,
+        is_remote=params.is_remote,
+        is_research=params.is_research,
+        posted_start=params.posted_start,
+        posted_end=params.posted_end,
+    )
 
     url = f"{_base_url()}/jobs"
     logger.info("search_jobs  url=%s  qs=%s", url, qs)
@@ -90,16 +193,14 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-# ── Tool: job_stats ─────────────────────────────────────────────────────────
-
+# Tool: job_stats
 
 def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Aggregate job counts grouped by a whitelisted column.
 
-    PostgREST doesn't support GROUP BY natively, so we fetch the column
-    and aggregate in-process (fast — the column is indexed, and we only
-    pull one field per row with a generous limit).
+    PostgREST does not support GROUP BY natively, so we fetch the grouped
+    column and aggregate in-process.
     """
     params = JobStatsInput(**raw_input)
 
@@ -109,18 +210,14 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
         "limit": "5000",
     }
 
-    if params.country:
-        qs["country"] = f"ilike.%{params.country}%"
-    if params.is_remote is not None:
-        qs["is_remote"] = f"eq.{str(params.is_remote).lower()}"
-
-    # Date-range filters
-    if params.posted_start and params.posted_end:
-        qs["and"] = f"(posted_date.gte.{params.posted_start},posted_date.lte.{params.posted_end})"
-    elif params.posted_start:
-        qs["posted_date"] = f"gte.{params.posted_start}"
-    elif params.posted_end:
-        qs["posted_date"] = f"lte.{params.posted_end}"
+    _apply_common_filters(
+        qs,
+        country=params.country,
+        is_remote=params.is_remote,
+        is_research=params.is_research,
+        posted_start=params.posted_start,
+        posted_end=params.posted_end,
+    )
 
     url = f"{_base_url()}/jobs"
     logger.info("job_stats  url=%s  qs=%s", url, qs)
@@ -152,9 +249,7 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
             else:
                 delta = count - previous_count
                 percent_change = (
-                    None
-                    if previous_count == 0
-                    else round((delta / previous_count) * 100, 2)
+                    None if previous_count == 0 else round((delta / previous_count) * 100, 2)
                 )
 
             result.append(
@@ -209,7 +304,7 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-# ── Tool registry ──────────────────────────────────────────────────────────
+# Tool registry
 
 # Claude tool schemas (Anthropic Messages API format)
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -222,16 +317,34 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "role_keyword": {"type": "string", "description": "Search keyword to filter by position name/title (e.g. 'Data Scientist', 'Software Engineer', 'Product Manager')"},
+                "role_keyword": {
+                    "type": "string",
+                    "description": "Search keyword to filter by position name/title (e.g. Data Scientist, Software Engineer, Product Manager)",
+                },
                 "country": {"type": "string", "description": "Country name filter"},
                 "is_remote": {"type": "boolean", "description": "Remote jobs only"},
-                "job_level_std": {"type": "string", "description": "Job level (e.g. Junior, Mid, Senior)"},
+                "job_level_std": {
+                    "type": "string",
+                    "description": "Job level (e.g. Junior, Mid, Senior)",
+                },
                 "job_function_std": {"type": "string", "description": "Job function category"},
-                "company_industry_std": {"type": "string", "description": "Company industry"},
-                "platform": {"type": "string", "description": "Job platform (e.g. LinkedIn, Indeed)"},
+                "company_industry_std": {
+                    "type": "string",
+                    "description": "Company industry",
+                },
+                "platform": {
+                    "type": "string",
+                    "description": "Job platform (e.g. LinkedIn, Indeed)",
+                },
                 "is_research": {"type": "boolean", "description": "Research positions only"},
-                "posted_start": {"type": "string", "description": "ISO date YYYY-MM-DD — return jobs posted on or after this date (inclusive)"},
-                "posted_end": {"type": "string", "description": "ISO date YYYY-MM-DD — return jobs posted on or before this date (inclusive)"},
+                "posted_start": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD - return jobs posted on or after this date (inclusive)",
+                },
+                "posted_end": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD - return jobs posted on or before this date (inclusive)",
+                },
                 "limit": {"type": "integer", "description": "Max results (default 20, max 100)"},
             },
         },
@@ -264,15 +377,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "country": {"type": "string", "description": "Optional country filter"},
                 "is_remote": {"type": "boolean", "description": "Optional remote filter"},
-                "posted_start": {"type": "string", "description": "ISO date YYYY-MM-DD — count jobs posted on or after this date"},
-                "posted_end": {"type": "string", "description": "ISO date YYYY-MM-DD — count jobs posted on or before this date"},
+                "is_research": {"type": "boolean", "description": "Optional research filter"},
+                "posted_start": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD - count jobs posted on or after this date",
+                },
+                "posted_end": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD - count jobs posted on or before this date",
+                },
             },
             "required": ["metric", "group_by"],
         },
     },
 ]
 
-# Map tool name → executor function
+# Map tool name -> executor function
 TOOL_EXECUTORS: dict[str, Any] = {
     "search_jobs": execute_search_jobs,
     "job_stats": execute_job_stats,

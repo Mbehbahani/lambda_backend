@@ -102,3 +102,4 @@ DEPLOYMENT_*.md
 #   git rm -r --cached .
 #   git add .
 #   git commit -m "Add .gitignore"
+scripts/update-lambda.ps1

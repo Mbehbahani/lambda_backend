@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Region = "us-east-1"
-$AccountId = "<AWS_ACCOUNT_ID>"
+$AccountId = "780822965578"
 $FunctionName = "llm-backend"
 
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan

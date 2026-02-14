@@ -119,6 +119,9 @@ Never ignore temporal constraints.
 - Never approximate.
 - Never assume.
 - Always rely strictly on tool output.
+- Never drop an explicit user filter (country, research, remote, date, platform, level).
+- If user asks for "European countries"/"Europe", pass country="Europe".
+- If user asks for research positions, pass is_research=true.
 - If zero → say zero.
 - If empty → say no data found.
 
@@ -171,6 +174,9 @@ DB_RELATED_KEYWORDS = [
     "change",
     "hiring",
     "posted",
+    "research",
+    "europe",
+    "european",
 ]
 
 
@@ -196,6 +202,35 @@ _NEGATIVE_PATTERNS = [
     "thats all", "all good", "nothing else",
 ]
 
+_NEGATED_RESEARCH_PATTERNS = [
+    "non research",
+    "non-research",
+    "not research",
+    "exclude research",
+    "excluding research",
+    "without research",
+]
+
+_EUROPE_COUNTRY_SCOPE_PATTERNS = [
+    "european countries",
+    "europe countries",
+    "in europe",
+    "across europe",
+    "european",
+    "europe",
+]
+
+_EUROPE_COUNTRY_ALIASES = {
+    "europe",
+    "european",
+    "european countries",
+    "europe countries",
+    "eu",
+    "eu countries",
+    "europe union",
+    "european union",
+}
+
 
 def _is_affirmative_followup(prompt: str) -> bool:
     """Check if prompt is a short affirmative/continuation response."""
@@ -209,6 +244,60 @@ def _is_negative_followup(prompt: str) -> bool:
     return prompt_lower in _NEGATIVE_PATTERNS
 
 
+def _infer_research_filter(prompt: str) -> bool | None:
+    """
+    Infer an explicit research filter from user text.
+    Returns:
+      - True for research-only intent
+      - False for non-research intent
+      - None when no explicit intent is present
+    """
+    prompt_lower = prompt.lower()
+    if any(pattern in prompt_lower for pattern in _NEGATED_RESEARCH_PATTERNS):
+        return False
+    if "research" in prompt_lower:
+        return True
+    return None
+
+
+def _infer_country_scope(prompt: str) -> str | None:
+    """Infer a synthetic country-scope keyword from user text."""
+    prompt_lower = prompt.lower()
+    if any(pattern in prompt_lower for pattern in _EUROPE_COUNTRY_SCOPE_PATTERNS):
+        return "Europe"
+    return None
+
+
+def _enforce_prompt_filters(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    prompt: str,
+) -> dict[str, Any]:
+    """
+    Defensive guardrail: if the prompt clearly asks for a filter and the model omits it,
+    inject that filter before executing the tool.
+    """
+    if tool_name not in {"search_jobs", "job_stats"}:
+        return dict(tool_input)
+
+    adjusted_input = dict(tool_input)
+    country_value = adjusted_input.get("country")
+    if isinstance(country_value, str):
+        normalized_country = country_value.strip().lower()
+        if normalized_country in _EUROPE_COUNTRY_ALIASES:
+            adjusted_input["country"] = "Europe"
+
+    research_filter = _infer_research_filter(prompt)
+    if research_filter is not None and adjusted_input.get("is_research") is None:
+        adjusted_input["is_research"] = research_filter
+
+    country_scope = _infer_country_scope(prompt)
+    if country_scope is not None and not adjusted_input.get("country"):
+        adjusted_input["country"] = country_scope
+
+    return adjusted_input
+
+
 def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
     """
     Convert a previous tool call into an expanded follow-up call.
@@ -218,7 +307,13 @@ def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
     if tool_name == "job_stats":
         # User asked for a count → now show the actual listings
         new_args: dict[str, Any] = {}
-        for key in ("country", "is_remote", "posted_start", "posted_end"):
+        for key in (
+            "country",
+            "is_remote",
+            "is_research",
+            "posted_start",
+            "posted_end",
+        ):
             if key in tool_args and tool_args[key] is not None:
                 new_args[key] = tool_args[key]
         new_args["limit"] = 20
@@ -227,7 +322,13 @@ def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
     if tool_name == "search_jobs":
         # User saw listings → now show a statistical breakdown
         new_args = {"metric": "count", "group_by": "job_function_std"}
-        for key in ("country", "is_remote", "posted_start", "posted_end"):
+        for key in (
+            "country",
+            "is_remote",
+            "is_research",
+            "posted_start",
+            "posted_end",
+        ):
             if key in tool_args and tool_args[key] is not None:
                 new_args[key] = tool_args[key]
         return "job_stats", new_args
@@ -438,12 +539,6 @@ async def ask(body: AskRequest):
             tool_calls = extract_tool_calls(raw)
             logger.info("Claude requested %d tool call(s)", len(tool_calls))
 
-            # Collect tool call metadata for the response
-            for tc in tool_calls:
-                collected_tool_calls.append(
-                    {"name": tc["name"], "input": tc["input"]}
-                )
-
             # Append the full assistant content (text + tool_use blocks)
             messages.append({"role": "assistant", "content": raw["content"]})
 
@@ -451,8 +546,19 @@ async def ask(body: AskRequest):
             tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
                 tool_name = tc["name"]
-                tool_input = tc["input"]
+                raw_tool_input = tc["input"]
                 tool_id = tc["id"]
+                tool_input = _enforce_prompt_filters(tool_name, raw_tool_input, body.prompt)
+
+                if tool_input != raw_tool_input:
+                    logger.info(
+                        "Adjusted tool input from prompt constraints: %s raw=%s adjusted=%s",
+                        tool_name,
+                        raw_tool_input,
+                        tool_input,
+                    )
+
+                collected_tool_calls.append({"name": tool_name, "input": tool_input})
 
                 executor = TOOL_EXECUTORS.get(tool_name)
                 if executor is None:

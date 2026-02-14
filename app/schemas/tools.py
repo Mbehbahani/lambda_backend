@@ -93,6 +93,7 @@ class JobStatsInput(BaseModel):
     group_by: str
     country: Optional[str] = None
     is_remote: Optional[bool] = None
+    is_research: Optional[bool] = None
     posted_start: Optional[str] = None
     posted_end: Optional[str] = None
 
