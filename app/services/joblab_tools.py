@@ -115,19 +115,51 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
 
 # Tool: job_stats
 
+def _paginated_fetch(
+    url: str,
+    headers: dict[str, str],
+    qs: dict[str, str],
+    *,
+    page_size: int = 1000,
+    max_rows: int = 15000,
+    timeout: int = 15,
+) -> list[dict[str, Any]]:
+    """
+    Paginate through PostgREST results using Range headers.
+    Returns all matching rows up to *max_rows*.
+    """
+    all_rows: list[dict[str, Any]] = []
+    offset = 0
+    fetch_headers = {**headers, "Prefer": "count=exact"}
+
+    while offset < max_rows:
+        page_qs = {**qs, "limit": str(page_size), "offset": str(offset)}
+        resp = requests.get(url, headers=fetch_headers, params=page_qs, timeout=timeout)
+        resp.raise_for_status()
+        page: list[dict[str, Any]] = resp.json()
+        if not page:
+            break
+        all_rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return all_rows
+
+
 def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Aggregate job counts grouped by a whitelisted column.
 
     PostgREST does not support GROUP BY natively, so we fetch the grouped
-    column and aggregate in-process.
+    column and aggregate in-process.  We paginate to avoid silently
+    truncating results.
     """
     params = JobStatsInput(**raw_input)
 
     select_column = "posted_date" if params.group_by == "posted_month" else params.group_by
     qs: dict[str, str] = {
         "select": select_column,
-        "limit": "5000",
     }
 
     _apply_common_filters(
@@ -143,9 +175,8 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     url = f"{_base_url()}/jobs"
     logger.info("job_stats  url=%s  qs=%s", url, qs)
 
-    resp = requests.get(url, headers=_headers(), params=qs, timeout=15)
-    resp.raise_for_status()
-    rows: list[dict[str, Any]] = resp.json()
+    rows = _paginated_fetch(url, _headers(), qs)
+    logger.info("job_stats  fetched %d total rows", len(rows))
 
     if params.group_by == "posted_month":
         logger.info("job_stats  monthly grouping activated total_rows=%d", len(rows))
