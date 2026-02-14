@@ -1,0 +1,104 @@
+# .gitignore for Python + AWS Lambda project
+# Exclude virtualenvs, caches, IDE files, OS junk, build artifacts and secrets
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.Python
+.python-version
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+pip-log.txt
+wheelhouse/
+
+# AWS / serverless / Lambda build artifacts
+.aws-sam/
+.serverless/
+.chalice/
+*.zip
+*.jar
+*.war
+lambda-package.zip
+
+# IDEs / editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# macOS / Windows files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tests / coverage / type checking
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.pytype/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# Sensitive / credential files
+.env
+.env.*
+secrets.yml
+credentials.json
+aws_credentials
+.aws/credentials
+.aws/config
+
+# Jupyter
+.ipynb_checkpoints
+
+# Node / frontend
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Database / local files
+*.sqlite3
+*.db
+*.pem
+
+# Misc
+__MACOSX/
+*.class
+
+# Project-specific sensitive / test files
+# - test payloads and deployment configs that may contain account IDs or secrets
+test-payload.json
+*.payload.json
+deployment/*.json
+DEPLOYMENT_*.md
+
+# If you already committed files that should be ignored, run:
+#   git rm -r --cached .
+#   git add .
+#   git commit -m "Add .gitignore"
