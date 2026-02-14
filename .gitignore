@@ -103,3 +103,4 @@ DEPLOYMENT_*.md
 #   git add .
 #   git commit -m "Add .gitignore"
 scripts/update-lambda.ps1
+run

@@ -130,3 +130,23 @@ class JobStatsInput(BaseModel):
     @classmethod
     def _validate_posted_end(cls, v: Optional[str]) -> Optional[str]:
         return _check_iso_date(v, "posted_end")
+
+
+# ── semantic_search_jobs ────────────────────────────────────────────────────
+
+DEFAULT_TOP_K = 5
+HARD_MAX_TOP_K = 20
+
+
+class SemanticSearchInput(BaseModel):
+    """Validated input for the semantic_search_jobs tool."""
+
+    query_text: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=HARD_MAX_TOP_K)
+
+    @field_validator("top_k", mode="before")
+    @classmethod
+    def _clamp_top_k(cls, v: int) -> int:
+        if v is None:
+            return DEFAULT_TOP_K
+        return min(int(v), HARD_MAX_TOP_K)

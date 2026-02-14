@@ -21,7 +21,9 @@ class Settings(BaseSettings):
     bedrock_model_id: str = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
     bedrock_max_tokens: int = 1024
     bedrock_temperature: float = 0.7
-
+    # ── Bedrock Embeddings ───────────────────────────────────
+    bedrock_embed_model_id: str = "amazon.titan-embed-text-v2:0"
+    embed_dimension: int = 512
     # ── Supabase ─────────────────────────────────────────
     supabase_url: str = ""
     supabase_service_role_key: str = ""

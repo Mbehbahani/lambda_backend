@@ -11,7 +11,8 @@ from typing import Any
 import requests
 
 from app.config import get_settings
-from app.schemas.tools import SAFE_COLUMNS, JobStatsInput, SearchJobsInput
+from app.schemas.tools import SAFE_COLUMNS, JobStatsInput, SearchJobsInput, SemanticSearchInput
+from app.services.embeddings import embed_text
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,70 @@ def execute_job_stats(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+# Tool: semantic_search_jobs
+
+def execute_semantic_search(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Semantic similarity search across job description chunks.
+
+    1. Validate input via SemanticSearchInput.
+    2. Embed the query text using Bedrock Titan V2.
+    3. Call Supabase RPC `match_job_chunks` with the embedding vector.
+    4. Return matched chunks with job_id, chunk_text, and similarity.
+    """
+    import time as _time
+
+    params = SemanticSearchInput(**raw_input)
+
+    start = _time.time()
+
+    # Step 1 — embed the query
+    query_embedding = embed_text(params.query_text)
+    embed_elapsed = round(_time.time() - start, 3)
+    logger.info(
+        "semantic_search  embedding generated  chars=%d  time=%.3fs",
+        len(params.query_text),
+        embed_elapsed,
+    )
+
+    # Step 2 — call Supabase RPC
+    settings = get_settings()
+    rpc_url = f"{settings.supabase_url.rstrip('/')}/rest/v1/rpc/match_job_chunks"
+    payload = {
+        "query_embedding": query_embedding,
+        "match_count": params.top_k,
+    }
+
+    resp = requests.post(
+        rpc_url,
+        headers=_headers(),
+        json=payload,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    rows: list[dict[str, Any]] = resp.json()
+
+    total_elapsed = round(_time.time() - start, 3)
+    logger.info(
+        "semantic_search  query='%s'  top_k=%d  returned=%d  total_time=%.3fs",
+        params.query_text[:80],
+        params.top_k,
+        len(rows),
+        total_elapsed,
+    )
+
+    # Step 3 — sanitize output (never expose raw vectors)
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        results.append({
+            "job_id": row.get("job_id"),
+            "chunk_text": row.get("chunk_text"),
+            "similarity": round(float(row.get("similarity", 0)), 4),
+        })
+
+    return results
+
+
 # Tool registry
 
 # Claude tool schemas (Anthropic Messages API format)
@@ -365,10 +430,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["metric", "group_by"],
         },
     },
+    {
+        "name": "semantic_search_jobs",
+        "description": (
+            "Semantic similarity search across job descriptions using vector embeddings. "
+            "Use this when users ask about concepts, topics, or skills that require "
+            "meaning-based matching rather than exact keyword filters. "
+            "For example: 'jobs related to stochastic optimization', "
+            "'positions about container shipping forecasting', "
+            "'roles involving NLP and transformers'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query_text": {
+                    "type": "string",
+                    "description": "The natural language query to search for semantically similar job descriptions.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of most similar results to return (default 5, max 20).",
+                },
+            },
+            "required": ["query_text"],
+        },
+    },
 ]
 
 # Map tool name -> executor function
 TOOL_EXECUTORS: dict[str, Any] = {
     "search_jobs": execute_search_jobs,
     "job_stats": execute_job_stats,
+    "semantic_search_jobs": execute_semantic_search,
 }
