@@ -23,6 +23,29 @@ Write-Host ""
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $LambdaDir = Split-Path -Parent $ScriptDir
 
+function Test-ZipContainsEntry {
+    param(
+        [string]$ZipPath,
+        [string[]]$Patterns
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $entryPath = $entry.FullName -replace "\\", "/"
+            foreach ($pattern in $Patterns) {
+                if ($entryPath -like $pattern) {
+                    return $true
+                }
+            }
+        }
+        return $false
+    } finally {
+        $zip.Dispose()
+    }
+}
+
 # Step 1: Create deployment package (if needed)
 if (-not $SkipPackage) {
     Write-Host "─────────────────────────────────────────────────────" -ForegroundColor Cyan
@@ -45,6 +68,25 @@ $DeploymentPackage = Join-Path $LambdaDir $PackageFile
 if (-not (Test-Path $DeploymentPackage)) {
     Write-Host "❌ Deployment package not found: $DeploymentPackage" -ForegroundColor Red
     Write-Host "   Run without -SkipPackage to create it" -ForegroundColor Yellow
+    exit 1
+}
+
+# Validate package freshness and required multipart dependency
+$RequirementsFile = Join-Path $LambdaDir "requirements.txt"
+if ($SkipPackage -and (Test-Path $RequirementsFile)) {
+    $ReqLastWrite = (Get-Item $RequirementsFile).LastWriteTimeUtc
+    $PkgLastWrite = (Get-Item $DeploymentPackage).LastWriteTimeUtc
+    if ($ReqLastWrite -gt $PkgLastWrite) {
+        Write-Host "ERROR: requirements.txt is newer than $PackageFile." -ForegroundColor Red
+        Write-Host "Rebuild package (run without -SkipPackage) before deploying." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+# /ai/match-cv uses request.form(), which requires python-multipart.
+if (-not (Test-ZipContainsEntry -ZipPath $DeploymentPackage -Patterns @("multipart/*", "python_multipart/*"))) {
+    Write-Host "ERROR: Deployment package is missing python-multipart." -ForegroundColor Red
+    Write-Host "Add python-multipart to requirements.txt and rebuild package." -ForegroundColor Yellow
     exit 1
 }
 

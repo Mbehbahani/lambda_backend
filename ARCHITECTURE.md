@@ -350,3 +350,43 @@ If issues arise:
 3. Lambda: Can be deleted without affecting ECS
 
 **Zero risk**: Old architecture remains untouched during migration.
+
+## CV Matching Flow (Dual DB)
+
+A separate endpoint (`POST /ai/match-cv`) implements CV-to-job matching using two databases:
+
+```
+Frontend (Next.js)
+    │
+    ▼  POST /ai/match-cv { cv_text }
+┌──────────────────────────────────────────────────────────┐
+│                    AWS Lambda                             │
+│                                                           │
+│  1. Receive CV text                                      │
+│  2. Normalize text                                       │
+│  3. Generate 512-dim embedding (Bedrock Titan V2)        │
+│  4. Store CV + embedding → Railway PostgreSQL (user_cvs) │
+│  5. Vector similarity search → Supabase (job_chunks RPC) │
+│  6. Enrich with job metadata → Supabase (jobs table)     │
+│  7. Store top matches → Railway (user_cvs.top_matches)   │
+│  8. Return CVMatchResponse (cv_id + top 10 matches)      │
+│                                                           │
+└──────────┬────────────────┬───────────────────────────────┘
+           │                │
+           ▼                ▼
+┌─────────────────┐  ┌────────────────────┐
+│ Railway Postgres │  │  Supabase Postgres  │
+│                  │  │                     │
+│ • user_cvs table │  │ • job_chunks table  │
+│   - raw_text     │  │   (vector search)   │
+│   - embedding    │  │ • jobs table        │
+│   - top_matches  │  │   (metadata)        │
+└─────────────────┘  └────────────────────┘
+```
+
+### Key design decisions:
+- **Embedding**: Reuses existing Bedrock Titan V2 service (512 dimensions)
+- **Vector search**: Uses existing `match_job_chunks` RPC on Supabase (cosine similarity via `<=>` operator)
+- **No new vector DB**: Leverages existing `job_chunks` IVFFlat index with `vector_cosine_ops`
+- **Dual DB**: Railway stores user CVs; Supabase stores jobs. No cross-DB dependencies.
+- **Deterministic**: No LLM interpretation — pure vector math in PostgreSQL

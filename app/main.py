@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import health, ai
+from app.routers import health, ai, cv_match
 
 settings = get_settings()
 
@@ -38,3 +38,4 @@ app.add_middleware(
 # ── Routers ─────────────────────────────────────────────────────────────────
 app.include_router(health.router)
 app.include_router(ai.router)
+app.include_router(cv_match.router)

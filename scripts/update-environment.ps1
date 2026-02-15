@@ -30,13 +30,35 @@ Write-Host "Loading environment variables from: $EnvFile" -ForegroundColor Yello
 
 # Parse .env file
 $EnvVars = @{}
+$ReservedLambdaKeys = @(
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_EXECUTION_ENV",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_VERSION",
+    "AWS_LAMBDA_INITIALIZATION_TYPE",
+    "AWS_LAMBDA_LOG_GROUP_NAME",
+    "AWS_LAMBDA_LOG_STREAM_NAME",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "_HANDLER",
+    "_X_AMZN_TRACE_ID",
+    "LAMBDA_RUNTIME_DIR",
+    "LAMBDA_TASK_ROOT",
+    "TZ"
+)
 Get-Content $EnvFilePath | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') {
         $name = $matches[1].Trim()
         $value = $matches[2].Trim()
         # Remove quotes if present
         $value = $value -replace '^[''"]|[''"]$', ''
-        if ($name -and $value -and -not $name.StartsWith('#')) {
+        if ($ReservedLambdaKeys -contains $name) {
+            Write-Host "Skipping reserved Lambda key: $name" -ForegroundColor Yellow
+        }
+        elseif ($name -and $value -and -not $name.StartsWith('#')) {
             $EnvVars[$name] = $value
         }
     }
@@ -57,16 +79,28 @@ foreach ($key in $EnvVars.Keys | Sort-Object) {
     }
 }
 
-# Convert to JSON for AWS CLI
-$EnvVarsJson = $EnvVars | ConvertTo-Json -Compress
-
 Write-Host ""
 Write-Host "Updating Lambda function: $FunctionName" -ForegroundColor Yellow
 
-aws lambda update-function-configuration `
-    --function-name $FunctionName `
-    --environment "Variables=$EnvVarsJson" `
-    --region $Region | Out-Null
+# Build environment payload as JSON file to avoid CLI quoting/escaping issues.
+$EnvPayload = @{
+    Variables = $EnvVars
+}
+$EnvPayloadJson = $EnvPayload | ConvertTo-Json -Compress
+$TempEnvFile = Join-Path $env:TEMP ("lambda-env-{0}.json" -f ([Guid]::NewGuid().ToString("N")))
+[System.IO.File]::WriteAllText($TempEnvFile, $EnvPayloadJson, (New-Object System.Text.UTF8Encoding($false)))
+
+try {
+    aws lambda update-function-configuration `
+        --function-name $FunctionName `
+        --environment "file://$TempEnvFile" `
+        --region $Region | Out-Null
+}
+finally {
+    if (Test-Path $TempEnvFile) {
+        Remove-Item $TempEnvFile -Force -ErrorAction SilentlyContinue
+    }
+}
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "✅ Environment variables updated successfully" -ForegroundColor Green
