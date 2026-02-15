@@ -83,6 +83,8 @@ def execute_search_jobs(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     }
 
     # Text search filters (PostgREST ilike operators)
+    if params.job_id:
+        qs["job_id"] = f"eq.{params.job_id}"
     if params.role_keyword:
         qs["actual_role"] = f"ilike.%{params.role_keyword}%"
     if params.job_level_std:
@@ -271,9 +273,12 @@ def execute_semantic_search(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     1. Validate input via SemanticSearchInput.
     2. Embed the query text using Bedrock Titan V2.
     3. Call Supabase RPC `match_job_chunks` with the embedding vector.
-    4. Return matched chunks with job_id, chunk_text, and similarity.
+    4. Enrich each result with job metadata (title, company, url, posted_date).
+    5. Filter out expired jobs (posted > 30 days ago).
+    6. Return matched chunks with full context.
     """
     import time as _time
+    from datetime import datetime, timedelta, timezone
 
     params = SemanticSearchInput(**raw_input)
 
@@ -288,12 +293,13 @@ def execute_semantic_search(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
         embed_elapsed,
     )
 
-    # Step 2 — call Supabase RPC
+    # Step 2 — call Supabase RPC (fetch extra to compensate for filtering)
     settings = get_settings()
     rpc_url = f"{settings.supabase_url.rstrip('/')}/rest/v1/rpc/match_job_chunks"
+    fetch_count = min(params.top_k * 3, 60)  # over-fetch to allow for expired filtering
     payload = {
         "query_embedding": query_embedding,
-        "match_count": params.top_k,
+        "match_count": fetch_count,
     }
 
     resp = requests.post(
@@ -305,23 +311,69 @@ def execute_semantic_search(raw_input: dict[str, Any]) -> list[dict[str, Any]]:
     resp.raise_for_status()
     rows: list[dict[str, Any]] = resp.json()
 
-    total_elapsed = round(_time.time() - start, 3)
-    logger.info(
-        "semantic_search  query='%s'  top_k=%d  returned=%d  total_time=%.3fs",
-        params.query_text[:80],
-        params.top_k,
-        len(rows),
-        total_elapsed,
-    )
+    # Step 3 — collect unique job_ids and fetch metadata from `jobs` table
+    unique_job_ids = list({row.get("job_id") for row in rows if row.get("job_id")})
+    job_meta: dict[str, dict[str, Any]] = {}
 
-    # Step 3 — sanitize output (never expose raw vectors)
+    if unique_job_ids:
+        # Batch-fetch metadata for all matched job_ids
+        meta_url = f"{_base_url()}/jobs"
+        # PostgREST: in filter for job_id
+        meta_qs = {
+            "select": "job_id,actual_role,company_name,country,location,url,posted_date,job_level_std,is_remote",
+            "job_id": f"in.({','.join(unique_job_ids)})",
+        }
+        meta_resp = requests.get(meta_url, headers=_headers(), params=meta_qs, timeout=15)
+        if meta_resp.status_code == 200:
+            for meta_row in meta_resp.json():
+                job_meta[meta_row["job_id"]] = meta_row
+        else:
+            logger.warning("Failed to fetch job metadata: %s", meta_resp.status_code)
+
+    # Step 4 — filter expired jobs (> 30 days old) and build enriched results
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
     results: list[dict[str, Any]] = []
+    seen_job_ids: set[str] = set()
+
     for row in rows:
+        job_id = row.get("job_id")
+        if not job_id or job_id in seen_job_ids:
+            continue
+
+        meta = job_meta.get(job_id, {})
+        posted_date = meta.get("posted_date", "")
+
+        # Skip expired jobs (posted more than 30 days ago)
+        if posted_date and posted_date < cutoff_date:
+            continue
+
+        seen_job_ids.add(job_id)
         results.append({
-            "job_id": row.get("job_id"),
-            "chunk_text": row.get("chunk_text"),
+            "job_id": job_id,
+            "actual_role": meta.get("actual_role", "Unknown"),
+            "company_name": meta.get("company_name", "Unknown"),
+            "country": meta.get("country", ""),
+            "location": meta.get("location", ""),
+            "url": meta.get("url", ""),
+            "posted_date": posted_date or "",
+            "job_level_std": meta.get("job_level_std", ""),
+            "is_remote": meta.get("is_remote"),
+            "chunk_text": row.get("chunk_text", ""),
             "similarity": round(float(row.get("similarity", 0)), 4),
         })
+
+        if len(results) >= params.top_k:
+            break
+
+    total_elapsed = round(_time.time() - start, 3)
+    logger.info(
+        "semantic_search  query='%s'  top_k=%d  returned=%d  expired_filtered=%d  total_time=%.3fs",
+        params.query_text[:80],
+        params.top_k,
+        len(results),
+        len(seen_job_ids) - len(results) + (len(rows) - len(seen_job_ids)),
+        total_elapsed,
+    )
 
     return results
 
@@ -340,6 +392,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Exact job_id to look up (e.g. linkedin_USA_li-4371085897_66811 or indeed_Germany_in-ac71aa15584565b0_5120). Use this when the user provides a job ID directly.",
+                },
                 "role_keyword": {
                     "type": "string",
                     "description": "Search keyword to filter by position name/title (e.g. Data Scientist, Software Engineer, Product Manager). Matched against the actual_role column.",

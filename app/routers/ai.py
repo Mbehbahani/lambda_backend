@@ -25,6 +25,8 @@ from app.services.conversation_memory import (
     get_pending_followup,
     set_pending_followup,
     clear_pending_followup,
+    set_mentioned_jobs,
+    get_mentioned_jobs,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,10 @@ If the user wants listings:
 - or asks about specific position names
 
 → Use search_jobs.
+
+If the user provides a specific job_id string (e.g. "linkedin_USA_li-4371085897_66811"
+or "indeed_Germany_in-ac71aa15584565b0_5120"):
+→ Use search_jobs with job_id parameter for an exact lookup.
 
 If the user asks about trends or changes:
 → Use job_stats with appropriate grouping.
@@ -195,12 +201,28 @@ After receiving tool results:
 - Mention increase/decrease magnitude concisely.
 - Do not hallucinate beyond provided data.
 
+When presenting individual job results (from search_jobs or semantic_search_jobs):
+- ALWAYS include the job_id for every job you mention.
+- ALWAYS include the URL (link) if available.
+- Present job details in a structured, scannable format.
+- Example format:
+  1. **Data Scientist** at Google (Amsterdam, NL)
+     - Level: Senior | Type: Full-time | Posted: 2026-02-10
+     - Job ID: abc-123
+     - Link: https://linkedin.com/...
+
 ────────────────────────
 7. CONVERSATION MEMORY RULES
 ────────────────────────
 If the user provides a short follow-up instruction (e.g. "only remote", "now Germany", "senior only"),
 interpret it as a refinement of the previous tool call.
 Modify previous filters accordingly instead of starting a new unrelated query.
+
+If the user asks for details about a specific job mentioned earlier (e.g. "tell me its job id",
+"give me the link", "more about the first one", "details on the Mendix job"):
+- Look at the [Previously mentioned jobs] context provided to you.
+- ALWAYS include the job_id and url in your response.
+- If multiple jobs were mentioned, identify the one the user is referring to.
 
 ────────────────────────
 8. FOLLOW-UP CONFIRMATION RULES
@@ -247,12 +269,56 @@ DB_RELATED_KEYWORDS = [
     "jobs involving",
     "skills like",
     "roles that deal with",
+    # Job detail follow-up triggers
+    "job id",
+    "link",
+    "url",
+    "detail",
+    "more about",
 ]
 
 
 def _is_database_related(prompt: str) -> bool:
     prompt_lower = prompt.lower()
     return any(keyword in prompt_lower for keyword in DB_RELATED_KEYWORDS)
+
+
+def _extract_jobs_from_results(tool_name: str, result_data: Any) -> list[dict[str, Any]]:
+    """
+    Extract slim job metadata from tool execution results.
+    Works for both search_jobs (returns job rows) and semantic_search_jobs
+    (returns enriched chunks with job metadata).
+    Returns a list of dicts suitable for set_mentioned_jobs().
+    """
+    jobs: list[dict[str, Any]] = []
+    if not isinstance(result_data, list):
+        return jobs
+    for row in result_data:
+        job_id = row.get("job_id")
+        if not job_id:
+            continue
+        jobs.append({
+            "job_id": job_id,
+            "actual_role": row.get("actual_role", ""),
+            "company_name": row.get("company_name", ""),
+            "url": row.get("url", ""),
+            "posted_date": row.get("posted_date", ""),
+            "country": row.get("country", ""),
+        })
+    return jobs
+
+
+def _is_job_detail_followup(prompt: str) -> bool:
+    """Detect if user is asking about a previously mentioned job."""
+    prompt_lower = prompt.lower()
+    triggers = [
+        "its job id", "its id", "its link", "its url", "the link",
+        "job id", "give me the link", "more about", "details on",
+        "tell me about the", "which one", "the first one", "the second",
+        "the third", "the last one", "more info", "more detail",
+        "show me the", "open the",
+    ]
+    return any(t in prompt_lower for t in triggers)
 
 
 # Short affirmative/vague follow-ups that imply "continue with previous context"
@@ -367,6 +433,13 @@ def _build_followup_args(tool_name: str, tool_args: dict) -> tuple[str, dict]:
                 new_args[key] = tool_args[key]
         return "job_stats", new_args
 
+    if tool_name == "semantic_search_jobs":
+        # User saw semantic results → show more results (double top_k, max 20)
+        prev_top_k = tool_args.get("top_k", 5)
+        new_args = dict(tool_args)
+        new_args["top_k"] = min(prev_top_k * 2, 20)
+        return "semantic_search_jobs", new_args
+
     # Fallback: re-run same tool
     return tool_name, dict(tool_args)
 
@@ -441,6 +514,11 @@ async def ask(body: AskRequest):
         # Store this as the new last tool
         set_last_tool(conversation_id, exec_tool_name, exec_tool_args)
 
+        # Store mentioned jobs for follow-up context
+        mentioned = _extract_jobs_from_results(exec_tool_name, result_data)
+        if mentioned:
+            set_mentioned_jobs(conversation_id, mentioned)
+
         # Send tool result to Claude for a natural language summary
         messages: list[dict[str, Any]] = [
             {
@@ -478,11 +556,40 @@ async def ask(body: AskRequest):
 
     # Retrieve last tool memory for follow-up refinement
     last_tool_name, last_tool_args = get_last_tool(conversation_id)
+    mentioned_jobs = get_mentioned_jobs(conversation_id)
 
     messages = []
 
+    # Build mentioned-jobs context string (if any)
+    jobs_context = ""
+    if mentioned_jobs:
+        jobs_lines = []
+        for j in mentioned_jobs[:10]:
+            jobs_lines.append(
+                f"  - job_id={j.get('job_id')} | {j.get('actual_role', '?')} "
+                f"at {j.get('company_name', '?')} | url={j.get('url', 'N/A')} "
+                f"| posted={j.get('posted_date', '?')} | country={j.get('country', '?')}"
+            )
+        jobs_context = (
+            "\n[Previously mentioned jobs (most recent first):\n"
+            + "\n".join(jobs_lines)
+            + "\n]\n"
+        )
+
+    # If user is asking about a previously mentioned job, answer directly
+    # from memory — no tool call needed.
+    is_job_followup = mentioned_jobs and _is_job_detail_followup(body.prompt)
+    if is_job_followup:
+        hint = (
+            f"{jobs_context}\n"
+            f"The user is asking about one of the previously mentioned jobs. "
+            f"Identify which job they mean and provide its job_id and url. "
+            f"You do NOT need to call a tool — the information is in the context above.\n\n"
+            f"User: {body.prompt}"
+        )
+        messages.append({"role": "user", "content": hint})
     # If user input is short and likely a refinement, inject a hint
-    if last_tool_name and len(body.prompt.split()) <= 6:
+    elif last_tool_name and len(body.prompt.split()) <= 6:
         is_affirmative = _is_affirmative_followup(body.prompt)
         if is_affirmative:
             hint = (
@@ -497,16 +604,26 @@ async def ask(body: AskRequest):
             hint = (
                 f"[Context: The previous tool used was '{last_tool_name}' "
                 f"with arguments {json.dumps(last_tool_args)}. "
-                f"The user is likely refining those filters.]\n\n"
+                f"The user is likely refining those filters.]{jobs_context}\n\n"
                 f"{body.prompt}"
             )
         messages.append({"role": "user", "content": hint})
     else:
-        messages.append({"role": "user", "content": body.prompt})
+        # For regular queries, append jobs context if available
+        prompt_with_context = body.prompt
+        if jobs_context:
+            prompt_with_context = f"{jobs_context}\n{body.prompt}"
+        messages.append({"role": "user", "content": prompt_with_context})
 
-    # A prompt is DB-related if it matches keywords OR is a follow-up to a previous tool call
-    db_related_prompt = _is_database_related(body.prompt) or (
-        last_tool_name is not None and len(body.prompt.split()) <= 6
+    # A prompt is DB-related if it matches keywords OR is a follow-up to a previous tool call.
+    # BUT: if it's a job-detail follow-up with known jobs, we already have the
+    # answer in memory — don't enforce tool calling.
+    db_related_prompt = (
+        not is_job_followup
+        and (
+            _is_database_related(body.prompt)
+            or (last_tool_name is not None and len(body.prompt.split()) <= 6)
+        )
     )
     no_tool_retry_count = 0
     has_called_tool = False
@@ -612,6 +729,15 @@ async def ask(body: AskRequest):
                 # Store last successful tool call in memory
                 if executor is not None:
                     set_last_tool(conversation_id, tool_name, tool_input)
+
+                    # Store mentioned jobs for follow-up context
+                    if tool_name in ("search_jobs", "semantic_search_jobs"):
+                        try:
+                            mentioned = _extract_jobs_from_results(tool_name, result_data)
+                            if mentioned:
+                                set_mentioned_jobs(conversation_id, mentioned)
+                        except Exception:
+                            pass  # non-fatal
 
                 tool_results.append(
                     {

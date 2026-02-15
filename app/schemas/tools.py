@@ -62,6 +62,7 @@ def _check_iso_date(v: Optional[str], field_name: str) -> Optional[str]:
 class SearchJobsInput(BaseModel):
     """Validated input for the search_jobs tool."""
 
+    job_id: Optional[str] = None
     role_keyword: Optional[str] = None
     country: Optional[str] = None
     is_remote: Optional[bool] = None

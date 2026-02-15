@@ -1,14 +1,18 @@
 """
 Lightweight in-memory conversation memory for session-based follow-up support.
 
-Stores only the last tool name, arguments, and pending follow-up per conversation.
-Memory resets on server restart — no persistence required.
+Stores the last tool name, arguments, pending follow-up, and recently
+mentioned jobs per conversation.  Memory resets on server restart —
+no persistence required.
 """
 
 from typing import Any
 from collections import defaultdict
 
 _MEMORY: dict[str, dict[str, Any]] = defaultdict(dict)
+
+# Keep only the N most-recent jobs in memory (newest first)
+_MAX_MENTIONED_JOBS = 10
 
 
 def get_memory(conversation_id: str) -> dict[str, Any]:
@@ -48,3 +52,38 @@ def clear_pending_followup(conversation_id: str) -> None:
     """Remove the pending follow-up after it has been handled."""
     if conversation_id in _MEMORY:
         _MEMORY[conversation_id].pop("pending_followup", None)
+
+
+# ── Recently mentioned jobs ───────────────────────────────────────────────
+
+
+def set_mentioned_jobs(conversation_id: str, jobs: list[dict[str, Any]]) -> None:
+    """
+    Store the jobs most recently surfaced to the user.
+
+    Each entry should be a slim dict:
+      { "job_id": ..., "actual_role": ..., "company_name": ..., "url": ..., "posted_date": ... }
+
+    Newest jobs go first; list is capped at _MAX_MENTIONED_JOBS.
+    Duplicates (by job_id) are removed, keeping the latest occurrence.
+    """
+    _MEMORY.setdefault(conversation_id, {})
+    existing: list[dict[str, Any]] = _MEMORY[conversation_id].get("mentioned_jobs", [])
+
+    # Merge: new jobs first, existing after, deduplicate by job_id
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for job in jobs + existing:
+        jid = job.get("job_id")
+        if jid and jid not in seen:
+            seen.add(jid)
+            merged.append(job)
+        if len(merged) >= _MAX_MENTIONED_JOBS:
+            break
+
+    _MEMORY[conversation_id]["mentioned_jobs"] = merged
+
+
+def get_mentioned_jobs(conversation_id: str) -> list[dict[str, Any]]:
+    """Return the most recently mentioned jobs (newest first)."""
+    return _MEMORY.get(conversation_id, {}).get("mentioned_jobs", [])
